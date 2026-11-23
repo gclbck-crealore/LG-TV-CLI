@@ -1,0 +1,101 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["aiowebostv==0.10.0"]
+# ///
+"""tv — LG webOS TV için mini kumanda.
+
+Kullanım:
+  tv netflix     Netflix'i aç
+  tv prime       Prime Video'yu aç
+  tv ayarlar     Ayarlar menüsünü aç
+  tv sessiz      Sesi kapat / aç (aç-kapa)
+  tv kapat       Televizyonu kapat
+  tv uygulamalar Yüklü uygulamaların ID'lerini listele
+
+TV adresi: LGTV_HOST ortam değişkeni (varsayılan: lgwebostv.home)
+İlk çalıştırmada TV ekranında çıkan izni kumandayla onaylayın.
+"""
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+from aiowebostv import WebOsClient
+
+HOST = os.environ.get("LGTV_HOST", "lgwebostv.home")
+KEY_FILE = Path.home() / ".config" / "lgtv" / "client_key"
+
+APPS = {
+    "netflix": ("Netflix", ["netflix"]),
+    "prime": ("Prime Video", ["amazon.global", "amazon", "com.amazon.amazonvideo.webos"]),
+    "ayarlar": ("Ayarlar", ["com.palm.app.settings"]),
+}
+
+
+def load_key() -> str | None:
+    return KEY_FILE.read_text().strip() if KEY_FILE.exists() else None
+
+
+def save_key(key: str) -> None:
+    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    KEY_FILE.write_text(key)
+    KEY_FILE.chmod(0o600)
+
+
+async def installed_app_ids(client: WebOsClient) -> set[str]:
+    res = await client.request("com.webos.applicationManager/listApps")
+    return {a["id"] for a in res.get("apps", [])}
+
+
+async def run(cmd: str) -> int:
+    key = load_key()
+    if not key:
+        print("İlk bağlantı: TV ekranındaki izni kumandayla onaylayın (60 sn)...")
+    client = WebOsClient(HOST, client_key=key, connect_timeout=60 if not key else 10)
+    try:
+        await client.connect()
+    except Exception as e:  # noqa: BLE001
+        print(f"TV'ye bağlanılamadı ({HOST}): {e}")
+        print("TV açık mı? Ayarlar > Ağ > LG Connect Apps açık mı?")
+        return 1
+    if client.client_key and client.client_key != key:
+        save_key(client.client_key)
+
+    try:
+        if cmd in APPS:
+            name, candidates = APPS[cmd]
+            ids = await installed_app_ids(client)
+            app_id = next((c for c in candidates if c in ids), None)
+            if not app_id:
+                print(f"{name} bu TV'de yüklü değil. 'tv uygulamalar' ile listeye bakın.")
+                return 1
+            await client.launch_app(app_id)
+            print(f"{name} açılıyor.")
+        elif cmd == "sessiz":
+            muted = (await client.get_audio_status()).get("mute", False)
+            await client.set_mute(not muted)
+            print("Ses açıldı." if muted else "Ses kapatıldı.")
+        elif cmd == "kapat":
+            # Doğrudan gönder: power_off() eski webOS'ta güç durumu bilinmezse sessizce hiçbir şey yapmıyor.
+            # TV kapanırken yanıt gelmeyebilir, bu yüzden yanıt beklenmiyor.
+            await client.command("request", "system/turnOff")
+            print("TV kapatılıyor.")
+        elif cmd == "uygulamalar":
+            for app_id in sorted(await installed_app_ids(client)):
+                print(app_id)
+        return 0
+    finally:
+        await client.disconnect()
+
+
+def main() -> int:
+    cmds = [*APPS, "sessiz", "kapat", "uygulamalar"]
+    if len(sys.argv) != 2 or sys.argv[1] not in cmds:
+        print(__doc__.strip())
+        return 0 if len(sys.argv) == 1 else 2
+    return asyncio.run(run(sys.argv[1]))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
