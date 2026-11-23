@@ -1,46 +1,184 @@
 #!/usr/bin/env -S uv run --quiet --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["aiowebostv==0.10.0"]
+# dependencies = ["aiowebostv==0.10.0", "mcp==2.3.0"]
 # ///
-"""tv — LG webOS TV için mini kumanda.
+"""tv — control an LG webOS TV from your terminal (and from Claude / ChatGPT via MCP).
 
-Kullanım:
-  tv netflix     Netflix'i aç
-  tv prime       Prime Video'yu aç
-  tv ayarlar     Ayarlar menüsünü aç
-  tv sessiz      Sesi kapat / aç (aç-kapa)
-  tv kapat       Televizyonu kapat
-  tv uygulamalar Yüklü uygulamaların ID'lerini listele
+Apps:
+  tv netflix | prime | youtube | blutv | exxen   Open an app
+  tv settings                                    Open the settings menu
+  tv live                                        Back to live TV
 
-TV adresi: LGTV_HOST ortam değişkeni (varsayılan: lgwebostv.home)
-İlk çalıştırmada TV ekranında çıkan izni kumandayla onaylayın.
+Control:
+  tv volume          Show the volume level
+  tv volume 20       Set volume to 20 (0-100)
+  tv volume + | -    Volume up / down one step
+  tv mute            Toggle mute
+  tv hdmi 1          Switch to an HDMI input (1-4)
+  tv notify "text"   Show a notification on the TV screen
+  tv off             Turn the TV off
+
+Info & setup:
+  tv status          Current app, volume and TV info
+  tv apps            List installed app IDs
+  tv discover        Find LG TVs on your network
+  tv setup           Pick a TV, save it and pair
+  tv mcp             Run as an MCP server over stdio (Claude Desktop, Claude Code, Codex)
+  tv mcp --http      Run as an MCP server over HTTP (ChatGPT, via a tunnel)
+  tv mcp-config      Print ready-to-paste MCP client configuration
+
+Turkish aliases: ayarlar, canli, ses, sessiz, mesaj, kapat, durum, uygulamalar, bul, kur.
+Config lives in ~/.config/lgtv/. LGTV_HOST overrides the saved TV address.
 """
 import asyncio
+import json
 import os
+import re
+import secrets
+import shutil
+import socket
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 from aiowebostv import WebOsClient
 
-HOST = os.environ.get("LGTV_HOST", "lgwebostv.home")
-KEY_FILE = Path.home() / ".config" / "lgtv" / "client_key"
+CONFIG_DIR = Path.home() / ".config" / "lgtv"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+KEY_FILE = CONFIG_DIR / "client_key"
+TOKEN_FILE = CONFIG_DIR / "mcp_token"
+DEFAULT_HOST = "lgwebostv.home"
+DEFAULT_HTTP_PORT = 8765
 
 APPS = {
     "netflix": ("Netflix", ["netflix"]),
     "prime": ("Prime Video", ["amazon.global", "amazon", "com.amazon.amazonvideo.webos"]),
-    "ayarlar": ("Ayarlar", ["com.palm.app.settings"]),
+    "youtube": ("YouTube", ["youtube.leanback.v4", "youtube.leanback.v3"]),
+    "blutv": ("BluTV", ["blutv"]),
+    "exxen": ("Exxen", ["lg.exxen.com"]),
+    "settings": ("Settings", ["com.palm.app.settings"]),
+    "live": ("Live TV", ["com.webos.app.livetv"]),
 }
+HDMI_APP = "com.webos.app.hdmi{}"
+
+ALIASES = {
+    "ayarlar": "settings", "canli": "live", "ses": "volume", "sessiz": "mute",
+    "mesaj": "notify", "kapat": "off", "durum": "status", "uygulamalar": "apps",
+    "bul": "discover", "kur": "setup",
+}
+
+
+class CliError(Exception):
+    """An error meant to be shown to the user."""
+
+
+def log(msg: str) -> None:
+    """Progress messages go to stderr so MCP stdio stays clean."""
+    print(msg, file=sys.stderr)
+
+
+# ---------- config ----------
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+
+
+def write_secret(path: Path, value: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_text(value)
+    path.chmod(0o600)
 
 
 def load_key() -> str | None:
     return KEY_FILE.read_text().strip() if KEY_FILE.exists() else None
 
 
-def save_key(key: str) -> None:
-    KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    KEY_FILE.write_text(key)
-    KEY_FILE.chmod(0o600)
+# ---------- discovery (SSDP) ----------
+
+SSDP_ST = "urn:lge-com:service:webos-second-screen:1"
+
+
+def discover(timeout: float = 3.0) -> list[dict]:
+    """Find LG webOS TVs on the LAN: [{host, name, uuid}]."""
+    msg = (
+        "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+        f'MAN: "ssdp:discover"\r\nMX: 2\r\nST: {SSDP_ST}\r\n\r\n'
+    ).encode()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.5)
+    found: dict[str, dict] = {}
+    try:
+        for _ in range(2):
+            sock.sendto(msg, ("239.255.255.250", 1900))
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                data, (ip, _port) = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            if ip in found:
+                continue
+            text = data.decode(errors="replace")
+            usn = re.search(r"(?im)^usn:\s*uuid:([0-9a-f-]+)", text)
+            loc = re.search(r"(?im)^location:\s*(\S+)", text)
+            found[ip] = {"host": ip, "name": ip, "uuid": usn.group(1) if usn else None}
+            if loc:
+                try:
+                    xml = urllib.request.urlopen(loc.group(1), timeout=2).read().decode(errors="replace")
+                    name = re.search(r"<friendlyName>(.*?)</friendlyName>", xml)
+                    if name:
+                        found[ip]["name"] = name.group(1)
+                except OSError:
+                    pass
+    finally:
+        sock.close()
+    return sorted(found.values(), key=lambda tv: tv["host"])
+
+
+# ---------- connection ----------
+
+async def _try_connect(host: str, key: str | None) -> WebOsClient:
+    client = WebOsClient(host, client_key=key, connect_timeout=60 if not key else 10)
+    await client.connect()
+    if client.client_key and client.client_key != key:
+        write_secret(KEY_FILE, client.client_key)
+    return client
+
+
+async def connect(allow_pairing: bool = True) -> WebOsClient:
+    cfg = load_config()
+    host = os.environ.get("LGTV_HOST") or cfg.get("host") or DEFAULT_HOST
+    key = load_key()
+    if not key:
+        if not allow_pairing:
+            raise CliError("This computer is not paired with the TV yet. Run `tv setup` in a terminal first.")
+        log("First connection: accept the prompt on the TV screen with your remote (60 s)...")
+    try:
+        return await _try_connect(host, key)
+    except Exception as first_err:  # noqa: BLE001
+        # The TV's IP may have changed: look it up again by its saved UUID.
+        uuid = cfg.get("uuid")
+        if uuid and not os.environ.get("LGTV_HOST"):
+            match = next((tv for tv in discover() if tv["uuid"] == uuid), None)
+            if match and match["host"] != host:
+                cfg["host"] = match["host"]
+                save_config(cfg)
+                log(f"TV found at a new address: {match['host']}")
+                return await _try_connect(match["host"], key)
+        raise CliError(
+            f"Could not connect to the TV ({host}): {first_err}\n"
+            "Is the TV on? Is Settings > Network > LG Connect Apps enabled? If needed: tv setup"
+        ) from first_err
 
 
 async def installed_app_ids(client: WebOsClient) -> set[str]:
@@ -48,53 +186,331 @@ async def installed_app_ids(client: WebOsClient) -> set[str]:
     return {a["id"] for a in res.get("apps", [])}
 
 
-async def run(cmd: str) -> int:
-    key = load_key()
-    if not key:
-        print("İlk bağlantı: TV ekranındaki izni kumandayla onaylayın (60 sn)...")
-    client = WebOsClient(HOST, client_key=key, connect_timeout=60 if not key else 10)
-    try:
-        await client.connect()
-    except Exception as e:  # noqa: BLE001
-        print(f"TV'ye bağlanılamadı ({HOST}): {e}")
-        print("TV açık mı? Ayarlar > Ağ > LG Connect Apps açık mı?")
-        return 1
-    if client.client_key and client.client_key != key:
-        save_key(client.client_key)
+def app_label(app_id: str | None) -> str:
+    if not app_id:
+        return "unknown"
+    for name, ids in APPS.values():
+        if app_id in ids:
+            return name
+    m = re.fullmatch(r"com\.webos\.app\.hdmi(\d)", app_id)
+    return f"HDMI {m.group(1)}" if m else app_id
 
+
+# ---------- actions (shared by CLI and MCP; each returns a message) ----------
+
+async def open_app(client: WebOsClient, app: str) -> str:
+    if app not in APPS:
+        raise CliError(f"Unknown app '{app}'. Choose one of: {', '.join(APPS)}")
+    name, candidates = APPS[app]
+    app_id = next((c for c in candidates if c in await installed_app_ids(client)), None)
+    if not app_id:
+        raise CliError(f"{name} is not installed on this TV. See `tv apps`.")
+    await client.launch_app(app_id)
+    return f"Opening {name}."
+
+
+async def volume_text(client: WebOsClient) -> str:
+    st = await client.get_audio_status()
+    return f"Volume: {st.get('volume')}" + (" (muted)" if st.get("mute") else "")
+
+
+async def set_volume(client: WebOsClient, level: int) -> str:
+    if not 0 <= level <= 100:
+        raise CliError("Volume must be between 0 and 100.")
+    await client.set_volume(level)
+    return await volume_text(client)
+
+
+async def step_volume(client: WebOsClient, up: bool) -> str:
+    await (client.volume_up() if up else client.volume_down())
+    return await volume_text(client)
+
+
+async def set_mute(client: WebOsClient, muted: bool | None = None) -> str:
+    """muted=None toggles."""
+    if muted is None:
+        muted = not (await client.get_audio_status()).get("mute", False)
+    await client.set_mute(muted)
+    return "Muted." if muted else "Unmuted."
+
+
+async def switch_hdmi(client: WebOsClient, port: int) -> str:
+    if port not in (1, 2, 3, 4):
+        raise CliError("HDMI port must be 1-4.")
+    app_id = HDMI_APP.format(port)
+    if app_id not in await installed_app_ids(client):
+        raise CliError(f"This TV has no HDMI {port} input.")
+    await client.launch_app(app_id)
+    return f"Switching to HDMI {port}."
+
+
+async def notify(client: WebOsClient, text: str) -> str:
+    if not text.strip():
+        raise CliError("Message text is empty.")
+    await client.send_message(text)
+    return "Notification shown."
+
+
+async def power_off(client: WebOsClient) -> str:
+    # Sent directly: power_off() silently does nothing on old webOS when the power state is unknown.
+    # The TV may not answer while shutting down, so no response is awaited.
+    await client.command("request", "system/turnOff")
+    return "Turning the TV off."
+
+
+async def status(client: WebOsClient) -> str:
+    cfg = load_config()
+    model = (client.tv_info.system or {}).get("modelName", "?")
+    return "\n".join([
+        f"TV:     {cfg.get('name', '?')} ({model}) @ {client.host}",
+        f"App:    {app_label(await client.get_current_app())}",
+        await volume_text(client),
+    ])
+
+
+async def list_apps(client: WebOsClient) -> str:
+    return "\n".join(sorted(await installed_app_ids(client)))
+
+
+async def with_tv(action, *args, allow_pairing: bool = True) -> str:
+    client = await connect(allow_pairing=allow_pairing)
     try:
-        if cmd in APPS:
-            name, candidates = APPS[cmd]
-            ids = await installed_app_ids(client)
-            app_id = next((c for c in candidates if c in ids), None)
-            if not app_id:
-                print(f"{name} bu TV'de yüklü değil. 'tv uygulamalar' ile listeye bakın.")
-                return 1
-            await client.launch_app(app_id)
-            print(f"{name} açılıyor.")
-        elif cmd == "sessiz":
-            muted = (await client.get_audio_status()).get("mute", False)
-            await client.set_mute(not muted)
-            print("Ses açıldı." if muted else "Ses kapatıldı.")
-        elif cmd == "kapat":
-            # Doğrudan gönder: power_off() eski webOS'ta güç durumu bilinmezse sessizce hiçbir şey yapmıyor.
-            # TV kapanırken yanıt gelmeyebilir, bu yüzden yanıt beklenmiyor.
-            await client.command("request", "system/turnOff")
-            print("TV kapatılıyor.")
-        elif cmd == "uygulamalar":
-            for app_id in sorted(await installed_app_ids(client)):
-                print(app_id)
-        return 0
+        return await action(client, *args)
     finally:
         await client.disconnect()
 
 
+# ---------- setup ----------
+
+def print_discovered() -> list[dict]:
+    log("Searching for LG TVs on your network...")
+    tvs = discover()
+    if not tvs:
+        log("No TV found. Is it on, on the same network, with LG Connect Apps enabled?")
+    for i, tv in enumerate(tvs, 1):
+        print(f"  {i}) {tv['name']}  [{tv['host']}]")
+    return tvs
+
+
+async def setup() -> None:
+    tvs = print_discovered()
+    if tvs:
+        hint = "1" if len(tvs) == 1 else f"1-{len(tvs)}"
+        choice = input(f"Pick a TV [{hint}] or type an IP address: ").strip() or "1"
+    else:
+        choice = input("Type the TV's IP address (empty to cancel): ").strip()
+        if not choice:
+            raise CliError("Setup cancelled.")
+    if choice.isdigit() and 1 <= int(choice) <= len(tvs):
+        tv = tvs[int(choice) - 1]
+    else:
+        tv = {"host": choice, "name": choice, "uuid": None}
+
+    old = load_config()
+    same_tv = (tv["uuid"] and tv["uuid"] == old.get("uuid")) or tv["host"] == old.get("host")
+    # Keep the key when there is no previous config (upgrade); the TV re-prompts if it rejects it.
+    if old and not same_tv and KEY_FILE.exists():
+        KEY_FILE.unlink()  # different TV: the old pairing key is useless
+    save_config(tv)
+    print(f"Saved: {tv['name']} [{tv['host']}]")
+
+    client = await connect()
+    try:
+        await client.send_message("LG-TV-CLI connected")
+        print("Paired. You should see 'LG-TV-CLI connected' on the TV.")
+    finally:
+        await client.disconnect()
+
+
+# ---------- MCP server ----------
+
+def mcp_launch_cmd() -> list[str]:
+    """Absolute command for MCP clients (GUI apps don't inherit your shell PATH)."""
+    uv = shutil.which("uv") or "uv"
+    return [str(Path(uv).resolve()), "run", "--quiet", "--script", str(Path(__file__).resolve()), "mcp"]
+
+
+def mcp_token() -> str:
+    if TOKEN_FILE.exists():
+        return TOKEN_FILE.read_text().strip()
+    token = secrets.token_urlsafe(24)
+    write_secret(TOKEN_FILE, token)
+    return token
+
+
+def build_mcp_server():
+    from typing import Literal
+
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+    from mcp_types import ToolAnnotations
+
+    async def tv_call(action, *args) -> str:
+        # Only ToolError text reaches the model; other exceptions become a generic error.
+        try:
+            return await with_tv(action, *args, allow_pairing=False)
+        except Exception as e:  # noqa: BLE001
+            raise ToolError(str(e)) from e
+
+    server = MCPServer(
+        name="lg-tv",
+        # WARNING also silences uvicorn access logs, which would print the secret URL path.
+        log_level="WARNING",
+        instructions=(
+            "Controls an LG webOS TV on the user's home network. The TV must already be on; "
+            "it cannot be turned on remotely. Use get_tv_status to see what is playing."
+        ),
+    )
+    app_names = Literal["netflix", "prime", "youtube", "blutv", "exxen", "settings", "live"]
+
+    @server.tool(annotations=ToolAnnotations(readOnlyHint=True))
+    async def get_tv_status() -> str:
+        """Get the TV model, the app or input currently on screen, and the volume/mute state."""
+        return await tv_call(status)
+
+    @server.tool()
+    async def open_tv_app(app: app_names) -> str:
+        """Open an app on the TV. 'live' returns to live TV, 'settings' opens the settings menu."""
+        return await tv_call(open_app, app)
+
+    @server.tool()
+    async def set_tv_volume(level: int) -> str:
+        """Set the TV volume to an absolute level from 0 to 100."""
+        return await tv_call(set_volume, level)
+
+    @server.tool()
+    async def step_tv_volume(direction: Literal["up", "down"]) -> str:
+        """Turn the TV volume up or down by one step."""
+        return await tv_call(step_volume, direction == "up")
+
+    @server.tool()
+    async def set_tv_mute(muted: bool) -> str:
+        """Mute (true) or unmute (false) the TV."""
+        return await tv_call(set_mute, muted)
+
+    @server.tool()
+    async def switch_tv_hdmi(port: int) -> str:
+        """Switch the TV to HDMI input 1, 2, 3 or 4."""
+        return await tv_call(switch_hdmi, port)
+
+    @server.tool()
+    async def show_tv_notification(message: str) -> str:
+        """Show a short notification message on the TV screen."""
+        return await tv_call(notify, message)
+
+    @server.tool(annotations=ToolAnnotations(destructiveHint=True))
+    async def turn_tv_off() -> str:
+        """Turn the TV off. It cannot be turned back on remotely."""
+        return await tv_call(power_off)
+
+    return server
+
+
+def run_mcp(args: list[str]) -> None:
+    server = build_mcp_server()
+    if "--http" not in args:
+        server.run("stdio")
+        return
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    port = DEFAULT_HTTP_PORT
+    if "--port" in args:
+        port = int(args[args.index("--port") + 1])
+    path = f"/mcp/{mcp_token()}"
+    log(f"MCP over HTTP: http://127.0.0.1:{port}{path}")
+    log("Expose it with a tunnel (e.g. `cloudflared tunnel --url http://127.0.0.1:%d`)" % port)
+    log("and give ChatGPT the tunnel URL + the same path. Keep the path secret: it is the password.")
+    server.run(
+        "streamable-http",
+        host="127.0.0.1",
+        port=port,
+        streamable_http_path=path,
+        # Requests arrive through a tunnel with its own Host header; the secret path is the access control.
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    )
+
+
+def print_mcp_config() -> None:
+    cmd = mcp_launch_cmd()
+    desktop = {"mcpServers": {"lg-tv": {"command": cmd[0], "args": cmd[1:]}}}
+    quoted = " ".join(f'"{c}"' if " " in c else c for c in cmd)
+    print("Claude Desktop — add to claude_desktop_config.json:")
+    print(json.dumps(desktop, indent=2))
+    print("\nClaude Code:")
+    print(f"  claude mcp add lg-tv -- {quoted}")
+    print("\nCodex CLI:")
+    print(f"  codex mcp add lg-tv -- {quoted}")
+    print("\nChatGPT (needs a public HTTPS URL):")
+    print("  tv mcp --http   # then expose it with a tunnel, see README")
+
+
+# ---------- CLI ----------
+
+async def run_cli(cmd: str, rest: list[str]) -> str | None:
+    arg = " ".join(rest) or None
+    if cmd == "setup":
+        await setup()
+        return None
+    if cmd in APPS:
+        return await with_tv(open_app, cmd)
+    if cmd == "volume":
+        if arg is None:
+            return await with_tv(volume_text)
+        if arg in ("+", "-"):
+            return await with_tv(step_volume, arg == "+")
+        if not arg.isdigit():
+            raise CliError("Usage: tv volume [0-100 | + | -]")
+        return await with_tv(set_volume, int(arg))
+    if cmd == "mute":
+        return await with_tv(set_mute, None)
+    if cmd == "hdmi":
+        if arg not in {"1", "2", "3", "4"}:
+            raise CliError("Usage: tv hdmi 1 (1-4)")
+        return await with_tv(switch_hdmi, int(arg))
+    if cmd == "notify":
+        if not arg:
+            raise CliError('Usage: tv notify "text"')
+        return await with_tv(notify, arg)
+    if cmd == "off":
+        return await with_tv(power_off)
+    if cmd == "status":
+        return await with_tv(status)
+    if cmd == "apps":
+        return await with_tv(list_apps)
+    raise CliError(f"Unknown command: {cmd}")
+
+
+COMMANDS = {*APPS, "volume", "mute", "hdmi", "notify", "off", "status", "apps",
+            "discover", "setup", "mcp", "mcp-config"}
+
+
 def main() -> int:
-    cmds = [*APPS, "sessiz", "kapat", "uygulamalar"]
-    if len(sys.argv) != 2 or sys.argv[1] not in cmds:
+    args = sys.argv[1:]
+    if not args or args[0] in {"-h", "--help", "help", "yardim", "yardım"}:
         print(__doc__.strip())
-        return 0 if len(sys.argv) == 1 else 2
-    return asyncio.run(run(sys.argv[1]))
+        return 0
+    cmd = ALIASES.get(args[0], args[0])
+    if cmd not in COMMANDS:
+        print(f"Unknown command: {args[0]}\n\n{__doc__.strip()}")
+        return 2
+    try:
+        if cmd == "discover":
+            print_discovered()
+        elif cmd == "mcp":
+            run_mcp(args[1:])
+        elif cmd == "mcp-config":
+            print_mcp_config()
+        else:
+            out = asyncio.run(run_cli(cmd, args[1:]))
+            if out:
+                print(out)
+    except CliError as e:
+        print(e, file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+    return 0
 
 
 if __name__ == "__main__":
