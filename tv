@@ -202,7 +202,8 @@ async def open_app(client: WebOsClient, app: str) -> str:
     if app not in APPS:
         raise CliError(f"Unknown app '{app}'. Choose one of: {', '.join(APPS)}")
     name, candidates = APPS[app]
-    app_id = next((c for c in candidates if c in await installed_app_ids(client)), None)
+    ids = await installed_app_ids(client)
+    app_id = next((c for c in candidates if c in ids), None)
     if not app_id:
         raise CliError(f"{name} is not installed on this TV. See `tv apps`.")
     await client.launch_app(app_id)
